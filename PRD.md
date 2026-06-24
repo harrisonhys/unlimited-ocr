@@ -1,6 +1,6 @@
-# PRD: Unlimited-OCR Service
+# PRD: PaddleOCR Service
 
-> Product Requirements Document for self-hosted OCR service based on [baidu/Unlimited-OCR](https://github.com/baidu/Unlimited-OCR)
+> Product Requirements Document for self-hosted OCR microservice using [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — supports Indonesian & English.
 
 **Author:** Hari (harrisonhys)  
 **Date:** 2026-06-24  
@@ -10,30 +10,29 @@
 
 ## 1. Problem Statement
 
-Need reliable, unlimited OCR capability — no API quotas, no per-image billing. Existing cloud OCR (Google Vision, Azure, Tesseract) either cost money per request or produce low-quality results on complex documents (tables, handwriting, multi-column layouts).
+Need reliable, unlimited OCR — no API quotas, no per-request billing. Cloud OCR (Google Vision, Azure) cost money; Tesseract accuracy too low on complex Indonesian documents (mixed fonts, poor scan quality, tables).
 
-Baidu's Unlimited-OCR model achieves SOTA on long-horizon document parsing via single-shot inference, built on DeepSeek-OCR architecture. Self-hosting removes vendor lock-in and usage caps.
+PaddleOCR provides SOTA accuracy with models under 100MB, supports 100+ languages including Indonesian (Latin script), and runs on both CPU and GPU. Self-hosting removes vendor lock-in.
 
 ## 2. Goals
 
 | # | Goal | MVP |
 |---|------|-----|
-| G1 | User sends image → returns extracted text | MVP-1 |
+| G1 | User sends image → returns extracted text (ID + EN) | MVP-1 |
 | G2 | User sends PDF → returns extracted text (all pages) | MVP-1 |
 | G3 | Image preprocessing: resize/compress large inputs | MVP-1 |
 | G4 | REST API with async job queue | MVP-1 |
-| G5 | Multi-worker GPU inference | MVP-2 |
-| G6 | Streaming response for large documents | MVP-2 |
-| G7 | Batch upload (multiple files) | MVP-2 |
-| G8 | Auth / API key management | MVP-2 |
+| G5 | Multi-worker inference | MVP-2 |
+| G6 | Batch upload (multiple files) | MVP-2 |
+| G7 | API key auth + rate limiting | MVP-2 |
 
 ## 3. Non-Goals (MVP-1)
 
 - ❌ Web UI / frontend
 - ❌ Document layout visualization
 - ❌ Fine-tuning / training
-- ❌ Multi-language selection (model auto-detects)
 - ❌ Billing / usage metering
+- ❌ Formula / table structure extraction (use PaddleOCR-VL later)
 
 ## 4. Architecture
 
@@ -45,12 +44,11 @@ Baidu's Unlimited-OCR model achieves SOTA on long-horizon document parsing via s
                                                    │
                                           ┌────────▼────────┐
                                           │  Worker Pool     │
-                                          │  (Celery + GPU)  │
+                                          │  (Celery)        │
                                           │                  │
                                           │  ┌────────────┐  │
-                                          │  │ SGLang Srv │  │
-                                          │  │ Unlimited  │  │
-                                          │  │   OCR      │  │
+                                          │  │ PaddleOCR  │  │
+                                          │  │  (engine)   │  │
                                           │  └────────────┘  │
                                           └─────────────────┘
 ```
@@ -61,26 +59,49 @@ Baidu's Unlimited-OCR model achieves SOTA on long-horizon document parsing via s
 |-----------|------|---------|
 | API Server | FastAPI + uvicorn | HTTP endpoints, validation, job dispatch |
 | Job Queue | Celery + Redis | Async task management, retry, status tracking |
-| Workers | Celery workers | Execute OCR jobs against model |
-| Inference | SGLang server | High-throughput model serving (OpenAI-compatible API) |
-| Storage | Local filesystem | Temporary file storage (input/output), auto-cleanup |
-| Model | baidu/Unlimited-OCR | Document parsing VLM (~16GB VRAM) |
+| Workers | Celery workers | Execute OCR jobs |
+| OCR Engine | PaddleOCR (Python API) | Detection + recognition inference |
+| Storage | Local filesystem | Temporary files, auto-cleanup |
+| Models | PP-OCRv4 / PP-OCRv5 | Pre-trained multilingual models |
 
-### Why SGLang over raw Transformers
+### Why PaddleOCR
 
-- SGLang provides OpenAI-compatible API endpoint → clean worker separation
-- Built-in batching, streaming, KV-cache management
-- Custom logit processor support (no_repeat_ngram) already integrated
-- Can scale to multi-GPU later via tensor parallelism
+- **Model size:** 10.5MB (mobile) to 81MB (server) — fits anywhere
+- **Languages:** 100+ langs including Indonesian (Latin script family)
+- **Speed:** CPU ~17ms recognition (mobile), GPU ~1ms (server high-perf)
+- **Backends:** CPU (OpenVINO), GPU (TensorRT/CUDA), Apple Silicon
+- **No external API:** 100% offline after model download
 
-## 5. API Design
+## 5. Language Support
+
+### Indonesian + English Strategy
+
+| Aspect | Detail |
+|--------|--------|
+| Script | Indonesian uses Latin alphabet — covered by PaddleOCR Latin/multilingual models |
+| Recommended model | `PP-OCRv4_server_rec_doc` (182MB) or `PP-OCRv5_server_rec` (81MB) for best accuracy |
+| Mobile alternative | `PP-OCRv4_mobile_rec` (10.5MB) for CPU-only deployments |
+| Language code | Use `lang='en'` or `lang='latin'` in PaddleOCR init — both cover English + Indonesian characters |
+| Special chars | All standard Latin chars (a-z, A-Z, é, è, ê, ñ, etc.) supported |
+
+### Model Selection Matrix
+
+| Deployment | Model | Size | GPU VRAM | CPU RAM | Latency/img |
+|------------|-------|------|----------|---------|-------------|
+| Edge / low-spec | PP-OCRv4_mobile | 10.5 MB | 0 GB | 2 GB | ~50-100 ms |
+| Balanced | PP-OCRv5_mobile | 16 MB | 0 GB | 4 GB | ~30-50 ms |
+| Server (recommended) | PP-OCRv5_server | 81 MB | 2-4 GB | 8 GB | ~10-20 ms |
+| High-accuracy docs | PP-OCRv4_server_doc | 182 MB | 4-6 GB | 16 GB | ~15-25 ms |
+
+**MVP-1 default:** PP-OCRv5_server (best accuracy/size ratio, supports EN + ID).
+
+## 6. API Design
 
 ### Endpoints
 
 ```
 POST   /api/v1/ocr                    # Submit OCR job (image or PDF)
 GET    /api/v1/ocr/{job_id}           # Get job status + result
-GET    /api/v1/ocr/{job_id}/stream    # SSE stream for large docs
 DELETE /api/v1/ocr/{job_id}           # Cancel job
 GET    /health                        # Health check
 ```
@@ -92,7 +113,7 @@ GET    /health                        # Health check
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `file` | File | ✅ | Image (jpg/png/webp) or PDF |
-| `mode` | string | ❌ | `gundam` (crop, default) or `base` |
+| `lang` | string | ❌ | `id_en` (default) or `en` |
 | `dpi` | int | ❌ | PDF render DPI (default: 300) |
 | `priority` | string | ❌ | `normal` (default) or `high` |
 
@@ -112,7 +133,7 @@ GET    /health                        # Health check
   "job_id": "ocr_a1b2c3d4",
   "status": "queued",
   "created_at": "2026-06-24T10:00:00Z",
-  "estimated_seconds": 15
+  "estimated_seconds": 5
 }
 ```
 
@@ -123,15 +144,16 @@ GET    /health                        # Health check
   "job_id": "ocr_a1b2c3d4",
   "status": "completed",
   "result": {
-    "text": "Extracted markdown/text content...",
+    "text": "Extracted text content...",
     "pages": 3,
-    "processing_time_ms": 12400
+    "processing_time_ms": 4200,
+    "language": "id_en",
+    "confidence_avg": 0.92
   },
   "meta": {
     "file_name": "invoice.pdf",
     "file_type": "pdf",
-    "mode": "gundam",
-    "model": "Unlimited-OCR"
+    "model": "PP-OCRv5_server"
   }
 }
 ```
@@ -146,12 +168,12 @@ GET    /health                        # Health check
   "status": "failed",
   "error": {
     "code": "PROCESSING_ERROR",
-    "message": "Model inference timeout after 120s"
+    "message": "OCR inference timeout after 60s"
   }
 }
 ```
 
-## 6. Image Preprocessing Pipeline
+## 7. Image Preprocessing Pipeline
 
 ```
 Input Image
@@ -173,16 +195,22 @@ Input Image
        │
        ▼
 ┌──────────────┐
-│ Mode Select  │ ← gundam (crop small regions) or base (full image)
+│ PaddleOCR    │ ← detect text boxes, recognize text
+│ inference    │
 └──────┬───────┘
        │
        ▼
-   SGLang inference
+   Text + confidence scores
 ```
 
-**Why resize:** Model trained on `image_size=640` (gundam) or `1024` (base). Sending 4K+ images wastes memory without improving accuracy. Resize before sending to model.
+**Detection input sizing:**
 
-## 7. PDF Processing Pipeline
+| Model Tier | Detection input size | Rationale |
+|------------|---------------------|-----------|
+| Mobile | 736 px longest side | Fast, low memory |
+| Server | 1280 px longest side | Better small text detection |
+
+## 8. PDF Processing Pipeline
 
 ```
 Input PDF
@@ -205,21 +233,22 @@ Input PDF
        │
        ▼
 ┌──────────────┐
-│ infer_multi  │ ← batch all pages in single model call
+│ PaddleOCR    │ ← run OCR per page
+│ per page     │
 └──────┬───────┘
        │
        ▼
    Concatenated text result
 ```
 
-## 8. Project Structure
+## 9. Project Structure
 
 ```
 ~/projects/unlimited-ocr/
 ├── PRD.md                          # This document
-├── docker-compose.yml              # Full stack: api + worker + redis + sglang
+├── docker-compose.yml              # Full stack: api + worker + redis
 ├── Dockerfile.api                  # API server image
-├── Dockerfile.worker               # Worker + model image
+├── Dockerfile.worker               # Worker + PaddleOCR image
 ├── requirements.txt                # Python deps
 ├── .env.example                    # Template for secrets
 ├── src/
@@ -234,32 +263,33 @@ Input PDF
 │   │   ├── __init__.py
 │   │   ├── preprocessor.py         # Image resize/compress/validate
 │   │   ├── pdf_converter.py        # PDF → images via PyMuPDF
-│   │   └── ocr_client.py           # SGLang API client
+│   │   └── ocr_engine.py           # PaddleOCR wrapper
 │   ├── workers/
 │   │   ├── __init__.py
 │   │   ├── celery_app.py           # Celery config
 │   │   └── tasks.py                # OCR task definitions
 │   └── models/
 │       ├── __init__.py
-│       └── schemas.py              # Pydantic models (Job, Result, etc.)
+│       └── schemas.py              # Pydantic models
 ├── tests/
 │   ├── __init__.py
 │   ├── test_preprocessor.py
 │   ├── test_pdf_converter.py
+│   ├── test_ocr_engine.py
 │   ├── test_api.py
-│   └── fixtures/                   # Sample images/PDFs for testing
-│       ├── sample_invoice.jpg
-│       ├── sample_document.pdf
+│   └── fixtures/
+│       ├── sample_invoice_id.jpg
+│       ├── sample_document_en.pdf
 │       └── large_image.png
 ├── scripts/
 │   ├── setup.sh                    # First-time setup
-│   ├── start_sglang.sh             # Launch SGLang model server
+│   ├── download_models.py          # Download PaddleOCR models
 │   └── benchmark.py                # Load test / perf benchmark
 └── docs/
     └── api.md                      # API documentation
 ```
 
-## 9. Docker Compose (MVP-1: single worker)
+## 10. Docker Compose (MVP-1)
 
 ```yaml
 # docker-compose.yml
@@ -273,36 +303,6 @@ services:
     volumes:
       - redis_data:/data
 
-  sglang:
-    image: sglang:latest  # Custom build with model
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    ports:
-      - "10000:10000"
-    environment:
-      - CUDA_VISIBLE_DEVICES=0
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    command: >
-      python -m sglang.launch_server
-        --model baidu/Unlimited-OCR
-        --served-model-name Unlimited-OCR
-        --attention-backend fa3
-        --page-size 1
-        --mem-fraction-static 0.8
-        --context-length 32768
-        --enable-custom-logit-processor
-        --disable-overlap-schedule
-        --skip-server-warmup
-        --host 0.0.0.0
-        --port 10000
-
   api:
     build:
       context: .
@@ -311,121 +311,126 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - SGLANG_URL=http://sglang:10000
       - MAX_FILE_SIZE_MB=20
       - MAX_PDF_PAGES=50
       - TEMP_DIR=/tmp/ocr
+      - OCR_MODEL=PP-OCRv5_server
+      - OCR_LANG=id_en
     depends_on:
       - redis
-      - sglang
+    volumes:
+      - ./models:/app/models:ro
 
   worker:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Dockerfile.worker
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - SGLANG_URL=http://sglang:10000
+      - OCR_MODEL=PP-OCRv5_server
+      - OCR_LANG=id_en
       - CELERY_CONCURRENCY=2
+      - USE_GPU=false
     depends_on:
       - redis
-      - sglang
+    volumes:
+      - ./models:/app/models:ro
     command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=2
 
 volumes:
   redis_data:
 ```
 
-## 10. MVP-2: Multi-Worker Scaling
+## 11. MVP-2: Multi-Worker + GPU
 
 ```yaml
-# docker-compose.scale.yml (override for MVP-2)
+# docker-compose.scale.yml (override)
 services:
-  sglang-0:
-    extends: sglang
-    environment:
-      - CUDA_VISIBLE_DEVICES=0
-
-  sglang-1:
-    extends: sglang
-    environment:
-      - CUDA_VISIBLE_DEVICES=1
-
   worker:
     deploy:
       replicas: 4
     environment:
-      - SGLANG_URLS=http://sglang-0:10000,http://sglang-1:10000
-      - LOAD_BALANCE=round-robin
+      - USE_GPU=true
+      - CELERY_CONCURRENCY=1
+    runtime: nvidia
 ```
 
-**Multi-GPU strategy:**
+**Scaling strategy:**
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| Multiple SGLang instances (1 per GPU) | Simple, independent | No cross-GPU batching |
-| SGLang tensor parallelism | Better large-batch perf | More complex setup |
-| Celery round-robin across instances | Easy horizontal scaling | Need health checks |
+| Setup | Workers | GPU per worker | Concurrency |
+|-------|---------|----------------|-------------|
+| CPU small | 2 | 0 | 2 threads each |
+| CPU medium | 4 | 0 | 2 threads each |
+| GPU single | 1 | 1 | 1 process |
+| GPU multi | 4 | 1 each | 1 process each |
 
-MVP-2 start: multiple SGLang instances + Celery round-robin. Simpler, proven.
+**GPU note:** PaddleOCR with GPU uses ~2-4GB VRAM per worker. Single 16GB GPU can run 3-4 workers.
 
-## 11. Infrastructure Requirements
+## 12. Hardware Requirements
 
-### Minimum (MVP-1, single worker)
-
-| Resource | Spec | Notes |
-|----------|------|-------|
-| GPU | 1x NVIDIA GPU, 16GB+ VRAM | RTX 4090, A100, L40S |
-| RAM | 32GB | Model loading + PyMuPDF rendering |
-| Disk | 100GB | Model weights (~15GB) + temp files |
-| CPU | 8 cores | API + worker + Redis |
-| OS | Ubuntu 22.04+ | CUDA 12.9 compatible |
-
-### Recommended (MVP-2, multi-worker)
+### Minimum (MVP-1, CPU-only)
 
 | Resource | Spec | Notes |
 |----------|------|-------|
-| GPU | 2-4x NVIDIA GPU, 24GB+ VRAM | A100 40GB ideal |
-| RAM | 64GB | Multiple workers |
-| Disk | 500GB SSD | Temp file I/O critical |
+| CPU | 4 vCPU | Any modern x86_64 |
+| RAM | 8 GB | Model ~81MB + PDF rendering |
+| Disk | 50 GB | Model weights + temp files |
+| GPU | None | CPU inference acceptable for low traffic |
+
+### Recommended (MVP-1, moderate load)
+
+| Resource | Spec | Notes |
+|----------|------|-------|
+| CPU | 8 vCPU | FastAPI + workers + Redis |
+| RAM | 16 GB | Comfortable for concurrent PDFs |
+| Disk | 100 GB SSD | Temp file I/O critical |
+| GPU | Optional | 4-6 GB VRAM if using GPU |
+
+### High-Throughput (MVP-2, GPU)
+
+| Resource | Spec | Notes |
+|----------|------|-------|
+| GPU | 1-2x NVIDIA, 16GB+ VRAM | T4, A10, RTX 4090 |
+| RAM | 32 GB | Multiple workers |
+| Disk | 200 GB SSD | Model cache + outputs |
 
 ### Cloud Options
 
-| Provider | Instance | GPU | Cost/hr (approx) |
-|----------|----------|-----|-------------------|
+| Provider | Instance | GPU | Cost/hr |
+|----------|----------|-----|---------|
 | Lambda Labs | gpu_1x_a10 | A10 24GB | $0.60 |
 | RunPod | A100 40GB | A100 | $1.20 |
 | Vast.ai | RTX 4090 | 4090 24GB | $0.35 |
-| Modal | T4/A10G | pay-per-use | $0.00046/sec |
+| Current VPS | 14GB RAM, no GPU | CPU only | $existing |
 
-**Dev VPS (current):** No GPU. Use remote GPU instance for model serving, keep API + Redis on VPS.
+**Current VPS (14GB RAM, no GPU):** Can run CPU mode with PP-OCRv5_server. Sufficient for dev + low traffic.
 
-## 12. Tech Stack Summary
+## 13. Tech Stack Summary
 
 | Layer | Technology | Version |
 |-------|-----------|---------|
-| Language | Python | 3.12 |
+| Language | Python | 3.10+ |
 | API Framework | FastAPI | 0.115+ |
 | Task Queue | Celery | 5.4+ |
 | Message Broker | Redis | 7+ |
-| Model Serving | SGLang | 0.0.0.dev+ |
-| Model | baidu/Unlimited-OCR | latest |
+| OCR Engine | PaddleOCR | 3.7.0+ |
+| Model | PP-OCRv5_server | latest |
 | PDF Processing | PyMuPDF (fitz) | 1.27+ |
-| Image Processing | Pillow | 12.1+ |
+| Image Processing | Pillow | 10+ |
 | Containerization | Docker + Compose | 24+ |
 | HTTP Client | httpx | 0.28+ |
 
-## 13. Milestones & Timeline
+## 14. Milestones & Timeline
 
 ### MVP-1: Single Worker OCR Service (Week 1-2)
 
 | Day | Task | Deliverable |
 |-----|------|-------------|
 | D1 | Project scaffold, Dockerfile, deps | Empty project running |
-| D2 | SGLang server setup + health check | Model loads and responds |
+| D2 | Download models (PP-OCRv5_server, EN+ID) | Models cached locally |
 | D3 | Image preprocessor (validate, resize, compress) | `preprocessor.py` + tests |
 | D4 | PDF converter (PyMuPDF render) | `pdf_converter.py` + tests |
-| D5 | SGLang client (single/multi image) | `ocr_client.py` + tests |
+| D5 | PaddleOCR engine wrapper (ID+EN) | `ocr_engine.py` + tests |
 | D6 | Celery task definitions | `tasks.py` + job queue working |
 | D7 | FastAPI endpoints (POST, GET, DELETE) | API + tests |
 | D8 | Docker Compose full stack | `docker-compose.yml` up |
@@ -436,42 +441,40 @@ MVP-2 start: multiple SGLang instances + Celery round-robin. Simpler, proven.
 
 | Day | Task |
 |-----|------|
-| D11-12 | Multi-GPU SGLang setup + load balancing |
+| D11-12 | GPU support + TensorRT acceleration |
 | D13-14 | Celery worker pool scaling |
-| D15-16 | Streaming response (SSE) |
-| D17-18 | Batch upload endpoint |
-| D19-20 | API key auth + rate limiting |
+| D15-16 | Batch upload endpoint |
+| D17-18 | API key auth + rate limiting |
 
-## 14. Risks & Mitigations
+## 15. Risks & Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Model requires 16GB+ VRAM | Can't run on consumer GPUs < 16GB | Use quantized version if available, or rent A100 |
-| SGLang wheel is custom build | Install fragility | Pin exact wheel version in Dockerfile, cache in private registry |
-| Long inference time (>30s per page) | User timeout | Async jobs + SSE streaming + progress updates |
-| No GPU on current dev VPS | Can't test locally | Docker Compose with remote SGLang endpoint |
-| PyMuPDF memory on large PDFs | OOM on 100+ page docs | Stream pages, process in batches of 10 |
-| Model hallucination on poor quality images | Bad OCR output | Input validation + quality warnings + confidence scores (future) |
+| Indonesian accuracy on poor scans | Bad OCR | Use server model + 300 DPI, add confidence threshold |
+| CPU inference too slow for batch | User timeout | Async jobs + progress tracking; add GPU later |
+| PyMuPDF memory on large PDFs | OOM | Stream pages, process in batches of 10 |
+| Model download blocked (China CDN) | Can't start | Mirror models to HuggingFace, pre-download in Dockerfile |
+| Mixed-language text (ID + EN) | Wrong model selection | Use multilingual model by default, auto-detect not needed |
 
-## 15. Success Metrics
+## 16. Success Metrics
 
 | Metric | Target (MVP-1) | Target (MVP-2) |
 |--------|----------------|-----------------|
-| Single image latency | < 10s | < 5s |
-| 10-page PDF latency | < 60s | < 30s |
-| Concurrent requests | 1 | 10+ |
+| Single image latency | < 3s (CPU) | < 500ms (GPU) |
+| 10-page PDF latency | < 30s (CPU) | < 5s (GPU) |
+| Concurrent requests | 2 | 10+ |
 | Uptime | 99% | 99.5% |
 | Max file size | 20MB | 50MB |
 | Max PDF pages | 50 | 200 |
 
-## 16. Open Questions
+## 17. Open Questions
 
-1. **GPU procurement:** Rent cloud GPU (RunPod/Vast.ai) or buy dedicated? Affects cost model.
-2. **Deployment target:** Docker on new GPU VPS, or split (API on current VPS + GPU elsewhere)?
+1. **GPU procurement:** Rent cloud GPU or stay CPU-only on current VPS?
+2. **Deployment target:** Docker on current VPS, or split API + workers?
 3. **Auth scope:** API key per user, or single shared key for internal use?
-4. **Monitoring:** Prometheus + Grafana, or simpler (just logs + health endpoint)?
-5. **Backup strategy:** Job results persisted to DB (Postgres) or just Redis ephemeral?
+4. **Monitoring:** Prometheus + Grafana, or simple logs + health endpoint?
+5. **Backup strategy:** Job results persisted to DB or just Redis ephemeral?
 
 ---
 
-*Next step: Confirm GPU strategy, then scaffold project.*
+*Next step: Confirm hardware strategy, then scaffold project.*
